@@ -12,7 +12,7 @@ class ResidualBlock(nn.Module):
                                stride=1, padding=1, bias=False)
         self.bn2 = nn.BatchNorm2d(out_channels)
 
-        # Shortcut connection to match dimensions if stride > 1
+
         self.shortcut = nn.Sequential()
         if stride != 1 or in_channels != out_channels:
             self.shortcut = nn.Sequential(
@@ -23,7 +23,7 @@ class ResidualBlock(nn.Module):
     def forward(self, x):
         out = F.relu(self.bn1(self.conv1(x)))
         out = self.bn2(self.conv2(out))
-        out += self.shortcut(x) # The "Skip Connection"
+        out += self.shortcut(x) 
         out = F.relu(out)
         return out
 
@@ -32,15 +32,13 @@ class TinyResNet(nn.Module):
         super(TinyResNet, self).__init__()
         self.in_channels = 64
 
-        # Modified Stem for 64x64: Small kernel, no MaxPool
         self.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(64)
         
-        # ResNet Layers (each containing 2 Residual Blocks)
         self.layer1 = self._make_layer(64, 2, stride=1)
-        self.layer2 = self._make_layer(128, 2, stride=2) # Output: 32x32
-        self.layer3 = self._make_layer(256, 2, stride=2) # Output: 16x16
-        self.layer4 = self._make_layer(512, 2, stride=2) # Output: 8x8
+        self.layer2 = self._make_layer(128, 2, stride=2)
+        self.layer3 = self._make_layer(256, 2, stride=2) 
+        self.layer4 = self._make_layer(512, 2, stride=2)
 
         self.avg_pool = nn.AdaptiveAvgPool2d((1, 1))
         self.fc = nn.Linear(512, num_classes)
