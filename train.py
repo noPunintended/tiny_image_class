@@ -272,7 +272,7 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, device,
                 # Standard Mode
                 labels = batch['labels'].to(device)
                 # In standard mode, criterion is just a single CrossEntropyLoss object
-                logits = model(inputs, return_hierarchy=False) 
+                logits = model(inputs) 
                 loss = criterion(logits, labels)
         
         # Backprop (Same for both modes)
@@ -285,20 +285,21 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, device,
     return running_loss / len(loader)
 
 
-def evaluate(model, loader, criterion, device, use_hierarchy=False, lambdas=(0.5, 1.0, 1.0, 1.0)):
+def evaluate(model, loader, criterion, device, use_hierarchy=False, lambdas=(0.01, 1.0, 1.0, 1.0)):
     model.eval()
-    running_loss = 0.0
     
+    # Loss accumulators
+    total_loss, total_c_loss, total_m_loss, total_f_loss, total_cent_loss = 0, 0, 0, 0, 0
+    
+    # Accuracy accumulators
     correct_f1, correct_f5 = 0, 0 
     correct_c1, correct_m1 = 0, 0 
-    total = 0
+    total_samples = 0
     
-    # Placeholders for the last batch logs
-    last_l_c, last_l_m, last_l_f, last_l_cent = 0, 0, 0, 0
-
     with torch.no_grad():
         for batch in loader:
             inputs = batch['pixel_values'].to(device)
+            batch_size = inputs.size(0)
             
             if use_hierarchy:
                 h_labels = batch['hierarchical_label'].to(device)
@@ -306,53 +307,59 @@ def evaluate(model, loader, criterion, device, use_hierarchy=False, lambdas=(0.5
                 
                 features, (logits_c, logits_m, logits_f) = model(inputs)
                 
-                # Calculate ALL hierarchical loss components
+                # Component Losses
                 ce_fn = criterion['ce']
                 l_coarse = ce_fn(logits_c, t_coarse)
                 l_mid    = ce_fn(logits_m, t_mid)
                 l_fine   = ce_fn(logits_f, t_fine)
                 l_center = criterion['center'](features, t_fine)
                 
-                # Total loss matches the training formula
-                loss = (lambdas[0] * l_center + 
-                        lambdas[1] * l_coarse + 
-                        lambdas[2] * l_mid + 
-                        lambdas[3] * l_fine)
+                batch_loss = (lambdas[0] * l_center + lambdas[1] * l_coarse + 
+                              lambdas[2] * l_mid + lambdas[3] * l_fine)
                 
-                # Accuracy
+                # Accumulate component losses (unweighted for clear reporting)
+                total_c_loss += l_coarse.item()
+                total_m_loss += l_mid.item()
+                total_f_loss += l_fine.item()
+                total_cent_loss += l_center.item()
+                
+                # Accuracies
                 correct_c1 += logits_c.argmax(dim=1).eq(t_coarse).sum().item()
                 correct_m1 += logits_m.argmax(dim=1).eq(t_mid).sum().item()
-                
-                # Store for printing
-                last_l_c, last_l_m, last_l_f, last_l_cent = l_coarse, l_mid, l_fine, l_center
                 
                 labels = t_fine
                 outputs = logits_f
             else:
                 labels = batch['labels'].to(device)
-                outputs = model(inputs, return_hierarchy=False)
-                loss = criterion(outputs, labels)
+                outputs = model(inputs)
+                batch_loss = criterion(outputs, labels)
             
-            running_loss += loss.item()
+            total_loss += batch_loss.item()
             
+            # Top-1 and Top-5 Fine Accuracy
             _, pred1 = outputs.topk(1, 1, True, True)
             correct_f1 += pred1.eq(labels.view(-1, 1).expand_as(pred1)).sum().item()
             _, pred5 = outputs.topk(5, 1, True, True)
             correct_f5 += pred5.eq(labels.view(-1, 1).expand_as(pred5)).sum().item()
-            total += labels.size(0)
             
-    val_loss = running_loss / len(loader)
-    acc1 = 100. * correct_f1 / total
-    acc5 = 100. * correct_f5 / total
+            total_samples += batch_size
+            
+    # Calculate final averages
+    num_batches = len(loader)
+    avg_loss = total_loss / num_batches
+    acc1 = 100. * correct_f1 / total_samples
+    acc5 = 100. * correct_f5 / total_samples
     
     if use_hierarchy:
-        acc_c = 100. * correct_c1 / total
-        acc_m = 100. * correct_m1 / total
-        print(f"--- Hierarchical Diagnostics ---")
-        print(f"Accuracies -> Coarse: {acc_c:.2f}% | Mid: {acc_m:.2f}% | Fine: {acc1:.2f}%")
-        print(f"Losses     -> L_Coarse: {last_l_c:.4f} | L_Mid: {last_l_m:.4f} | L_Fine: {last_l_f:.4f} | Center: {last_l_cent:.4f}")
-
-    return val_loss, acc1, acc5
+        acc_c = 100. * correct_c1 / total_samples
+        acc_m = 100. * correct_m1 / total_samples
+        
+        print(f"\n--- Hierarchical Validation Report ---")
+        print(f"Accuracy | Coarse: {acc_c:.2f}% | Mid: {acc_m:.2f}% | Fine: {acc1:.2f}%")
+        print(f"Avg Loss | L1: {total_c_loss/num_batches:.4f} | L2: {total_m_loss/num_batches:.4f} | "
+              f"L3: {total_f_loss/num_batches:.4f} | Cent: {total_cent_loss/num_batches:.4f}")
+        
+    return avg_loss, acc1, acc5
 
 
 def get_per_class_accuracy(model, loader, device, num_classes=200):
@@ -428,7 +435,7 @@ def run_experiment(aug_level="standard", model_name="SimpleCNN", use_hierarchy=F
     # 2. Logging & Early Stopping Config
     history = []
     best_val_loss = float('inf')
-    patience = 15
+    patience = 5
     counter = 0
     max_epochs = 100
     
@@ -436,7 +443,7 @@ def run_experiment(aug_level="standard", model_name="SimpleCNN", use_hierarchy=F
     for epoch in range(max_epochs):
 
         if use_hierarchy:
-            train_loss = train_one_epoch(model, train_loader, criterion, optimizer, scaler, device, use_hierarchy=True, lambdas=(0.001, 1.0, 1.0, 1.0))
+            train_loss = train_one_epoch(model, train_loader, criterion, optimizer, scaler, device, use_hierarchy=True, lambdas=(0.01, 1.0, 1.0, 1.0))
 
         else:
             train_loss = train_one_epoch(model, train_loader, criterion, optimizer, scaler, device, use_hierarchy=False)
@@ -475,21 +482,21 @@ def run_experiment(aug_level="standard", model_name="SimpleCNN", use_hierarchy=F
     print("\n--- Performing Error Analysis on Validation Set ---")
     model.load_state_dict(torch.load(f"best_model_{aug_level}_{model_name}.pth"))
 
-    # Run the per-class check on VAL
-    val_per_class = get_per_class_accuracy(model, val_loader, device)
+    # # Run the per-class check on VAL
+    # val_per_class = get_per_class_accuracy(model, val_loader, device)
 
-    # Logic: Find the worst 5 classes to see where the model is struggling
-    worst_classes = sorted(val_per_class.items(), key=lambda x: x[1])[:5]
-    print(f"Hardest classes in Val: {worst_classes}")
+    # # Logic: Find the worst 5 classes to see where the model is struggling
+    # worst_classes = sorted(val_per_class.items(), key=lambda x: x[1])[:5]
+    # print(f"Hardest classes in Val: {worst_classes}")
 
 if __name__ == "__main__":
 
 
     # models = ["SimpleCNN", "TinyResNet"]
-    aug_levels = ["baseline", "standard", "heavy"]
+    # aug_levels = ["baseline", "standard", "heavy"]
     # for model_name in models:
     #     for aug_level in aug_levels:
     #         run_experiment(aug_level=aug_level, model_name=model_name)
 
-    for aug_level in aug_levels:
-        run_experiment(aug_level=aug_level, model_name="HierarchicalResNet", use_hierarchy=True)
+    # run_experiment(aug_level="standard", model_name="TinyResNet", use_hierarchy=False)
+    run_experiment(aug_level="standard", model_name="HierarchicalResNet", use_hierarchy=True)

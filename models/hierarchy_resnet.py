@@ -12,7 +12,6 @@ class HierarchicalResNet(nn.Module):
         # 1. Load your custom backbone
         base = TinyResNet(num_classes=num_l3)
         
-        # 2. Extract everything except the final FC layer
         self.backbone = nn.Sequential(
             base.conv1,
             base.bn1,
@@ -28,13 +27,14 @@ class HierarchicalResNet(nn.Module):
         self.fc_coarse = nn.Linear(512, num_l1)
         self.fc_mid = nn.Linear(512, num_l2)
         self.fc_fine = nn.Linear(512, num_l3)
-        self.dropout = nn.Dropout(p=0.25)
+        self.dropout = nn.Dropout(p=0.1)
 
     def forward(self, x, return_hierarchy=True):
         # Pass through your custom ResNet backbone
         out = self.backbone(x)
         features = torch.flatten(out, 1)
         
+        norm_features = F.normalize(features, p=2, dim=1)
         dropped_features = self.dropout(features)
         # Main Fine-grained Output
         logits_f = self.fc_fine(dropped_features)
@@ -47,4 +47,4 @@ class HierarchicalResNet(nn.Module):
         logits_m = self.fc_mid(dropped_features)
         
         # Features are returned for Center Loss (intra-class variance)
-        return features, (logits_c, logits_m, logits_f)
+        return norm_features, (logits_c, logits_m, logits_f)

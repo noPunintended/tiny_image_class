@@ -14,7 +14,7 @@ class CenterLoss(nn.Module):
         self.feat_dim = feat_dim
         
         # The centers 'cyi' are learnable parameters
-        self.centers = nn.Parameter(torch.randn(self.num_classes, self.feat_dim))
+        self.centers = nn.Parameter(torch.randn(self.num_classes, self.feat_dim) * 0.01)
 
 
     def forward(self, x, labels):
