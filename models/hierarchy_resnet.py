@@ -6,6 +6,9 @@ from models.res_net import TinyResNet
 
 
 class HierarchicalResNet(nn.Module):
+
+    ### This in part created based on:
+    ### Wen et al., 2016 (https://kpzhang93.github.io/papers/eccv2016.pdf)
     def __init__(self, num_l1, num_l2, num_l3=200):
         super(HierarchicalResNet, self).__init__()
         
@@ -27,7 +30,7 @@ class HierarchicalResNet(nn.Module):
         self.fc_coarse = nn.Linear(512, num_l1)
         self.fc_mid = nn.Linear(512, num_l2)
         self.fc_fine = nn.Linear(512, num_l3)
-        self.dropout = nn.Dropout(p=0.1)
+        self.dropout = nn.Dropout(p=0.25)
 
     def forward(self, x, return_hierarchy=True):
         # Pass through your custom ResNet backbone

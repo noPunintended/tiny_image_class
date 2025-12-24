@@ -2,238 +2,37 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import pandas as pd
-import os
-from torch.cuda.amp import GradScaler
-from torchvision import transforms
-from datasets import load_dataset
-from torch.utils.data import DataLoader
-
 
 from models.alex_net import SimpleCNN
 from models.res_net import TinyResNet
 from models.hierarchy_resnet import HierarchicalResNet
 from utils.losses import CenterLoss
-from utils.constants import TINY_IMAGENET_MEAN, TINY_IMAGENET_STD
-
-
-def get_hierarchy_map():
-    # Generate by LLM with human oversight
-    mapping = {}
-
-    for i in range(200):
-        # --- ANIMALS (0-53, 170, 184, 187, 198) ---
-        if i <= 53 or i in [170, 184, 187, 198]:
-            coarse = "Animal"
-            if i in [22, 23, 24, 25, 26, 187]: mid = "Canine"
-            elif i in [27, 28, 29, 30, 31]: mid = "Feline"
-            elif i in [33, 34, 35, 36, 37, 38, 39, 40, 184]: mid = "Insect"
-            elif i in [49, 50, 51]: mid = "Primate"
-            elif i in [0, 12, 13, 15, 16, 17, 41, 190]: mid = "Aquatic"
-            else: mid = "Other_Animal"
-
-        # --- ARTIFACTS / OBJECTS (54-166, 185, 186, 194, 196, 197) ---
-        elif 54 <= i <= 166 or i in [185, 186, 194, 196, 197]:
-            coarse = "Artifact"
-            if i in [64, 74, 86, 95, 99, 100, 103, 107, 108, 113, 123, 134, 142, 153, 155]:
-                mid = "Vehicle"
-            elif i in [55, 68, 71, 78, 97, 104, 111, 112, 124, 133, 138, 139, 145, 147, 158, 185]:
-                mid = "Clothing"
-            elif i in [60, 83, 88, 115, 143, 146, 151, 154, 159, 162]:
-                mid = "Structure"
-            else:
-                mid = "Object_Tool"
-
-        # --- FOOD / DRINK (167-169, 171-183, 193, 195, 199) ---
-        elif 167 <= i <= 183 or i in [169, 193, 195, 199]:
-            coarse = "Food"
-            if i in [175, 176, 177, 178, 179, 193, 195, 199]: mid = "Produce"
-            else: mid = "Prepared_Food"
-
-        # --- NATURE / SCENERY (188-192) ---
-        elif 188 <= i <= 192:
-            coarse = "Nature"
-            mid = "Landscape"
-            
-        else:
-            coarse, mid = "Misc", "Misc"
-            
-        mapping[i] = (mid, coarse)
-    
-    return mapping
-
-
-def get_hierarchical_metadata():
-    # Reuse the mapping logic we just finalized
-    h_map = get_hierarchy_map() 
-    
-    # Generate unique integer IDs for the new levels
-    mid_cats = sorted(list(set([m for m, c in h_map.values()])))
-    coarse_cats = sorted(list(set([c for m, c in h_map.values()])))
-    
-    mid_to_idx = {name: i for i, name in enumerate(mid_cats)}
-    coarse_to_idx = {name: i for i, name in enumerate(coarse_cats)}
-    
-    # Final lookup: fine_idx -> [coarse_idx, mid_idx]
-    lookup = {
-        k: [coarse_to_idx[v[1]], mid_to_idx[v[0]]] 
-        for k, v in h_map.items()
-    }
-    
-    return lookup, len(coarse_cats), len(mid_cats)
-
-
-def add_hierarchy_labels(sample, lookup):
-    """
-    Hugging Face map function to add hierarchical targets.
-    """
-    fine_label = sample['label']
-    coarse_label, mid_label = lookup[fine_label]
-    
-    sample['hierarchical_label'] = [coarse_label, mid_label, fine_label]
-    return sample
-
-
-def get_transforms(aug_type="standard"):
-    """
-    Returns specific transformation pipelines based on the experimental setup.
-    
-    Args:
-        aug_type (str): 'baseline', 'standard', or 'heavy'
-    """
-    
-    # Common ops for all validation and test sets
-    base_ops = [
-        transforms.Lambda(lambda x: x.convert("RGB")),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=TINY_IMAGENET_MEAN, std=TINY_IMAGENET_STD)
-    ]
-
-    if aug_type == "baseline":
-        # No augmentation: Used to establish the "Overfitting Baseline"
-        train_ops = base_ops
-        
-    elif aug_type == "standard":
-        # Standard geometric augmentations
-        train_ops = [
-            transforms.Lambda(lambda x: x.convert("RGB")),
-            transforms.RandomHorizontalFlip(p=0.5),
-            transforms.RandomRotation(15),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=TINY_IMAGENET_MEAN, std=TINY_IMAGENET_STD)
-        ]
-        
-    elif aug_type == "heavy":
-        # Aggressive augmentations: Color, Scale, and Erasing
-        train_ops = [
-            transforms.Lambda(lambda x: x.convert("RGB")),
-            transforms.RandomResizedCrop(64, scale=(0.7, 1.0)),
-            transforms.RandomHorizontalFlip(),
-            transforms.ColorJitter(brightness=0.2, contrast=0.2),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=TINY_IMAGENET_MEAN, std=TINY_IMAGENET_STD),
-            transforms.RandomErasing(p=0.2) # Forces the model to look at multiple features
-        ]
-    
-    return transforms.Compose(train_ops), transforms.Compose(base_ops)
-
-
-def prepare_dataloaders(batch_size=128, aug_level="standard", use_hierarchy=True):
-    """Loads, splits, and prepares DataLoaders."""
-    full_dataset = load_dataset("zh-plus/tiny-imagenet")
-    
-    hierarchy_counts = (200,)
-    if use_hierarchy:
-        mapper, n_coarse, n_mid = get_hierarchical_metadata()
-        full_dataset = full_dataset.map(lambda x: add_hierarchy_labels(x, mapper))
-        hierarchy_counts = (n_coarse, n_mid, 200)
-
-    test_ds = full_dataset["valid"]
-    train_val_split = full_dataset["train"].train_test_split(test_size=0.1, seed=42)
-    train_ds, val_ds = train_val_split["train"], train_val_split["test"]
-
-    train_tf, val_tf = get_transforms(aug_type=aug_level)
-
-    def transform_wrapper(examples, transform_func):
-        output = {
-            "pixel_values": [transform_func(i.convert("RGB")) for i in examples["image"]],
-            "labels": examples["label"]
-        }
-        if use_hierarchy:
-            output["hierarchical_label"] = examples["hierarchical_label"]
-        return output
-
-    train_ds.set_transform(lambda e: transform_wrapper(e, train_tf))
-    val_ds.set_transform(lambda e: transform_wrapper(e, val_tf))
-    test_ds.set_transform(lambda e: transform_wrapper(e, val_tf))
-
-    def collate_fn(batch):
-        data = {
-            'pixel_values': torch.stack([x['pixel_values'] for x in batch]),
-            'labels': torch.tensor([x['labels'] for x in batch])
-        }
-        if use_hierarchy:
-            data['hierarchical_label'] = torch.tensor([x['hierarchical_label'] for x in batch])
-        return data
-
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=collate_fn, num_workers=4)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, collate_fn=collate_fn)
-    test_loader = DataLoader(test_ds, batch_size=batch_size, collate_fn=collate_fn)
-
-    return train_loader, val_loader, test_loader, hierarchy_counts
-
-
-def evaluate(model, loader, device):
-    """Calculates Top-1 and Top-5 Accuracy."""
-    model.eval()
-    correct_1, correct_5, total = 0, 0, 0
-    with torch.no_grad():
-        for batch in loader:
-            inputs, labels = batch['pixel_values'].to(device), batch['labels'].to(device)
-            outputs = model(inputs)
-            
-            _, pred1 = outputs.topk(1, 1, True, True)
-            correct_1 += pred1.eq(labels.view(-1, 1).expand_as(pred1)).sum().item()
-            
-            _, pred5 = outputs.topk(5, 1, True, True)
-            correct_5 += pred5.eq(labels.view(-1, 1).expand_as(pred5)).sum().item()
-            
-            total += labels.size(0)
-    return (100. * correct_1 / total), (100. * correct_5 / total)
-
-
-def evaluate(model, loader, criterion, device):
-    """Calculates Loss, Top-1, and Top-5 Accuracy."""
-    model.eval()
-    running_loss = 0.0
-    correct_1, correct_5, total = 0, 0, 0
-    
-    with torch.no_grad():
-        for batch in loader:
-            inputs, labels = batch['pixel_values'].to(device), batch['labels'].to(device)
-            outputs = model(inputs)
-            
-            # Calculate Loss
-            loss = criterion(outputs, labels)
-            running_loss += loss.item()
-            
-            # Top-1 and Top-5 logic
-            _, pred1 = outputs.topk(1, 1, True, True)
-            correct_1 += pred1.eq(labels.view(-1, 1).expand_as(pred1)).sum().item()
-            
-            _, pred5 = outputs.topk(5, 1, True, True)
-            correct_5 += pred5.eq(labels.view(-1, 1).expand_as(pred5)).sum().item()
-            
-            total += labels.size(0)
-            
-    val_loss = running_loss / len(loader)
-    acc1 = 100. * correct_1 / total
-    acc5 = 100. * correct_5 / total
-    
-    return val_loss, acc1, acc5
+from utils.helper import prepare_dataloaders
 
 
 def train_one_epoch(model, loader, criterion, optimizer, scaler, device, 
                     use_hierarchy=False, lambdas=(0.5, 1.0, 1.0, 1.0)):
+    """
+        Performs a single training epoch over the dataset.
+
+        Supports both standard classification and hierarchical multi-task learning 
+        with Center Loss. Uses Automatic Mixed Precision (AMP) for optimized 
+        throughput on modern GPUs.
+
+        :param model: The neural network model (e.g., TinyResNet or HierarchicalResNet).
+        :param loader: DataLoader providing training batches.
+        :param criterion: Loss function(s). Either a single loss or a dict 
+                        containing 'ce' and 'center' for hierarchical mode.
+        :param optimizer: PyTorch optimizer (handles both model and center parameters).
+        :param scaler: GradScaler for AMP training.
+        :param device: torch.device ('cuda' or 'cpu').
+        :param use_hierarchy: Bool; if True, computes losses for three hierarchical 
+                            levels plus Center Loss.
+        :param lambdas: Tuple of weights (lambda_center, lambda_L1, lambda_L2, lambda_L3) 
+                        to balance the total hierarchical loss.
+        :return: Average training loss for the epoch.
+    """
+
     model.train()
     running_loss = 0.0
     
@@ -243,7 +42,7 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, device,
         
         with torch.amp.autocast('cuda'):
             if use_hierarchy:
-                # 1. Unpack labels correctly
+                # 1. Unpack labels
                 hierarchical_labels = batch['hierarchical_label']
                 if isinstance(hierarchical_labels, list):
                     hierarchical_labels = torch.stack(hierarchical_labels, dim=1)
@@ -286,6 +85,21 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, device,
 
 
 def evaluate(model, loader, criterion, device, use_hierarchy=False, lambdas=(0.01, 1.0, 1.0, 1.0)):
+    """
+    Evaluates the model on the validation or test set.
+
+    In hierarchical mode, it tracks and prints accuracy for Coarse, Mid, and 
+    Fine levels, as well as the raw average values of all four loss components.
+
+    :param model: The neural network to evaluate.
+    :param loader: DataLoader for the validation/test data.
+    :param criterion: Criterion dictionary or single loss function.
+    :param device: Device to perform computation on.
+    :param use_hierarchy: Bool; if True, performs multi-level hierarchical evaluation.
+    :param lambdas: Weights used for total loss calculation in hierarchical mode.
+    :return: Tuple of (average_loss, top1_fine_accuracy, top5_fine_accuracy).
+    """
+
     model.eval()
     
     # Loss accumulators
@@ -363,6 +177,19 @@ def evaluate(model, loader, criterion, device, use_hierarchy=False, lambdas=(0.0
 
 
 def get_per_class_accuracy(model, loader, device, num_classes=200):
+    """
+    Orchestrates the full training pipeline for a specific experimental setup.
+
+    Handles data loading, model initialization (Standard vs. Hierarchical), 
+    optimizing configurations, and training with early stopping. Saves the 
+    best model weights and training history logs.
+
+    :param aug_level: Type of data augmentation ('baseline', 'standard', 'heavy').
+    :param model_name: Name of the architecture ('SimpleCNN', 'TinyResNet', 'HierarchicalResNet').
+    :param use_hierarchy: Whether to utilize hierarchical labels and Center Loss.
+    :return: None. Outputs saved weights and .csv logs.
+    """
+
     model.eval()
     class_correct = list(0. for i in range(num_classes))
     class_total = list(0. for i in range(num_classes))
@@ -411,7 +238,7 @@ def run_experiment(aug_level="standard", model_name="SimpleCNN", use_hierarchy=F
         }
     
         optimizer = torch.optim.Adam([
-            {'params': model.parameters(), 'weight_decay': 5e-4},
+            {'params': model.parameters()},
             {'params': center_loss_fn.parameters(), 'lr': 0.5} 
         ], lr=learning_rate)
         
@@ -443,7 +270,7 @@ def run_experiment(aug_level="standard", model_name="SimpleCNN", use_hierarchy=F
     for epoch in range(max_epochs):
 
         if use_hierarchy:
-            train_loss = train_one_epoch(model, train_loader, criterion, optimizer, scaler, device, use_hierarchy=True, lambdas=(0.01, 1.0, 1.0, 1.0))
+            train_loss = train_one_epoch(model, train_loader, criterion, optimizer, scaler, device, use_hierarchy=True, lambdas=(0.001, 1.0, 1.0, 1.0))
 
         else:
             train_loss = train_one_epoch(model, train_loader, criterion, optimizer, scaler, device, use_hierarchy=False)
@@ -482,21 +309,15 @@ def run_experiment(aug_level="standard", model_name="SimpleCNN", use_hierarchy=F
     print("\n--- Performing Error Analysis on Validation Set ---")
     model.load_state_dict(torch.load(f"best_model_{aug_level}_{model_name}.pth"))
 
-    # # Run the per-class check on VAL
-    # val_per_class = get_per_class_accuracy(model, val_loader, device)
-
-    # # Logic: Find the worst 5 classes to see where the model is struggling
-    # worst_classes = sorted(val_per_class.items(), key=lambda x: x[1])[:5]
-    # print(f"Hardest classes in Val: {worst_classes}")
-
 if __name__ == "__main__":
 
 
-    # models = ["SimpleCNN", "TinyResNet"]
-    # aug_levels = ["baseline", "standard", "heavy"]
-    # for model_name in models:
-    #     for aug_level in aug_levels:
-    #         run_experiment(aug_level=aug_level, model_name=model_name)
+    models = ["SimpleCNN", "TinyResNet", "HierarchicalResNet"]
+    aug_levels = ["baseline", "standard", "heavy"]
 
-    # run_experiment(aug_level="standard", model_name="TinyResNet", use_hierarchy=False)
-    run_experiment(aug_level="standard", model_name="HierarchicalResNet", use_hierarchy=True)
+    for model_name in models:
+        for aug_level in aug_levels:
+            use_hierarchy = False
+            if model_name == "HierarchicalResNet":
+                use_hierarchy = True
+            run_experiment(aug_level=aug_level, model_name=model_name, use_hierarchy=use_hierarchy)
