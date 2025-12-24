@@ -4,6 +4,8 @@ from datasets import load_dataset
 from torch.utils.data import DataLoader
 
 from utils.constants import TINY_IMAGENET_MEAN, TINY_IMAGENET_STD
+from utils.class_map import i2d
+from datasets import load_dataset
 
 
 def convert_to_RGB(image):
@@ -209,3 +211,143 @@ def evaluate(model, loader, criterion, device):
     acc5 = 100. * correct_5 / total
     
     return val_loss, acc1, acc5
+
+
+from sklearn.metrics import precision_score
+import torch.nn.functional as F
+
+def evaluate_final(model, loader, device, is_hierarchical=True):
+    model.eval()
+    all_preds = []
+    all_labels = []
+    
+    top1_correct = 0
+    top5_correct = 0
+    total = 0
+
+    with torch.no_grad():
+        for batch in loader:
+            inputs = batch['pixel_values'].to(device)
+            targets = batch['labels'].to(device) # Always use the 200-class labels for fine test
+            
+            output = model(inputs)
+            
+            # Extract fine-grained logits
+            if is_hierarchical:
+                # Based on your HierarchicalResNet forward: features, (c, m, f)
+                logits = output[1][2] 
+            else:
+                logits = output
+            
+            # Top-1 Accuracy
+            _, pred = logits.max(1)
+            top1_correct += pred.eq(targets).sum().item()
+            
+            # Top-5 Accuracy
+            _, top5_preds = logits.topk(5, 1, True, True)
+            top5_correct += top5_preds.eq(targets.view(-1, 1).expand_as(top5_preds)).sum().item()
+            
+            total += targets.size(0)
+            
+            all_preds.extend(pred.cpu().numpy())
+            all_labels.extend(targets.cpu().numpy())
+
+    # Calculate Metrics
+    acc1 = 100. * top1_correct / total
+    acc5 = 100. * top5_correct / total
+    # Macro precision: average precision across all 200 classes
+    precision = precision_score(all_labels, all_preds, average='macro', zero_division=0) * 100
+    
+    return acc1, acc5, precision
+
+
+def get_class_performance(model, loader, device, is_hierarchical=True):
+    model.eval()
+    class_correct = [0] * 200
+    class_total = [0] * 200
+    
+    with torch.no_grad():
+        for batch in loader:
+            inputs = batch['pixel_values'].to(device)
+            targets = batch['labels'].to(device)
+            
+            output = model(inputs)
+            logits = output[1][2] if is_hierarchical else output
+            
+            _, predicted = torch.max(logits, 1)
+            c = (predicted == targets).squeeze()
+            
+            for i in range(len(targets)):
+                label = targets[i].item()
+                class_correct[label] += c[i].item()
+                class_total[label] += 1
+                
+    accs = {i: (class_correct[i] / class_total[i]) * 100 for i in range(200) if class_total[i] > 0}
+    return accs
+
+
+def print_top_bottom(perf_dict, title):
+    sorted_classes = sorted(perf_dict.items(), key=lambda x: x[1], reverse=True)
+    print(f"\n--- {title} ---")
+    print("Top 5 Best Classes:")
+    for cid, acc in sorted_classes[:5]:
+        print(f"  Class {cid:3}: {acc:.2f}%")
+    print("Bottom 5 Worst Classes:")
+    for cid, acc in sorted_classes[-5:]:
+        print(f"  Class {cid:3}: {acc:.2f}%")
+
+
+def get_class_performance(model, loader, device, is_hierarchical=True):
+
+    model.eval()
+    class_correct = [0] * 200
+    class_total = [0] * 200
+    
+    with torch.no_grad():
+        for batch in loader:
+            inputs = batch['pixel_values'].to(device)
+            targets = batch['labels'].to(device)
+            
+            output = model(inputs)
+            logits = output[1][2] if is_hierarchical else output
+            
+            _, predicted = torch.max(logits, 1)
+            c = (predicted == targets).squeeze()
+            
+            for i in range(len(targets)):
+                label = targets[i].item()
+                class_correct[label] += c[i].item()
+                class_total[label] += 1
+                
+    accs = {i: (class_correct[i] / class_total[i]) * 100 for i in range(200) if class_total[i] > 0}
+    return accs
+
+
+def print_top_bottom(perf_dict, title):
+
+    # 1. Load Full Dataset to get class wnids
+    full_dataset = load_dataset("zh-plus/tiny-imagenet")
+    class_wnids = full_dataset['train'].features['label'].names
+
+    # 2. Map Index -> wnid -> Description
+    # We use .get() in case a wnid is missing from your i2d snippet
+    mapping = {
+        i: i2d.get(wnid, "Description Not Found") 
+        for i, wnid in enumerate(class_wnids)
+    }
+
+    # Sort by accuracy
+    sorted_classes = sorted(perf_dict.items(), key=lambda x: x[1], reverse=True)
+    
+    print(f"\n{'='*25} {title} {'='*25}")
+    
+    print("\nTOP 5 BEST CLASSES:")
+    for cid, acc in sorted_classes[:5]:
+        desc = mapping[cid].split(',')[0] # Get the first word of the description
+        print(f"  {acc:>6.2f}% | ID: {cid:<3} | Name: {desc}")
+        
+    print("\nBOTTOM 5 WORST CLASSES:")
+    for cid, acc in sorted_classes[-5:]:
+        desc = mapping[cid].split(',')[0]
+        print(f"  {acc:>6.2f}% | ID: {cid:<3} | Name: {desc}")
+        
